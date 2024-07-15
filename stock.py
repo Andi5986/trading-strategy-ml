@@ -6,6 +6,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score
 from openai import OpenAI
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -36,7 +38,7 @@ class StockData:
         rs = gain / loss
         data['RSI'] = 100 - (100 / (1 + rs))
         
-        data['Daily_Return'] = data['Close'].pct_change()
+        data['Daily_Return'] = data['Close'].pct_change(fill_method=None)
         data['Volatility'] = data['Daily_Return'].rolling(window=20).std()
         
         # MACD
@@ -61,13 +63,36 @@ class StockData:
         return data
 
 class MLModel:
-    def __init__(self, n_estimators=100, random_state=42):
-        self.model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state)
+    def __init__(self, n_estimators=100, random_state=42, test_size=0.3):
+        self.model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, 
+                                           max_depth=10, min_samples_split=5, min_samples_leaf=2)
         self.scaler = StandardScaler()
+        self.test_size = test_size
 
     def train(self, X, y):
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=self.test_size, random_state=42)
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # Perform cross-validation
+        cv_scores = cross_val_score(self.model, X_train_scaled, y_train, cv=5, scoring='neg_mean_squared_error')
+        cv_rmse = np.sqrt(-cv_scores)
+        
+        self.model.fit(X_train_scaled, y_train)
+        
+        y_pred = self.model.predict(X_test_scaled)
+        
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_test, y_pred)
+        
+        print(f"Model Performance:")
+        print(f"MSE: {mse:.6f}")
+        print(f"RMSE: {rmse:.6f}")
+        print(f"R²: {r2:.6f}")
+        print(f"Cross-validation RMSE: {cv_rmse.mean():.6f} (+/- {cv_rmse.std() * 2:.6f})")
+        
+        return mse, rmse, r2, cv_rmse.mean()
 
     def predict(self, X):
         X_scaled = self.scaler.transform(X)
@@ -111,7 +136,7 @@ class TradingStrategy:
         
         X, y = np.array(X), np.array(y)
         
-        self.ml_model.train(X, y)
+        mse, rmse, r2, cv_rmse = self.ml_model.train(X, y)
         predictions = self.ml_model.predict(X)
         
         top_indices = predictions.argsort()[-self.num_stocks:][::-1]
@@ -136,7 +161,7 @@ class TradingStrategy:
                 'Free Cash Flow': info.get('freeCashflow', 'N/A')
             })
         
-        return top_stocks, self.ml_model.feature_importances, pd.DataFrame(table_data)
+        return top_stocks, self.ml_model.feature_importances, pd.DataFrame(table_data), (mse, rmse, r2, cv_rmse)
 
     @staticmethod
     def create_custom_index(stocks, weights, start_date, end_date):
@@ -153,7 +178,7 @@ class LLMExplainer:
     def __init__(self, api_key):
         self.client = OpenAI(api_key=api_key) if api_key else None
 
-    def get_explanation(self, stocks, feature_importances):
+    def get_explanation(self, stocks, feature_importances, stock_data):
         if not self.client:
             return "LLM explanation not available. Please provide a valid OpenAI API key."
 
@@ -163,16 +188,22 @@ class LLMExplainer:
         
         feature_importance_str = ", ".join([f"{feature}: {importance:.4f}" for feature, importance in zip(features, feature_importances)])
 
+        stock_info = "\n".join([f"{stock}: Price: ${data['Price']:.2f}, RSI: {data['RSI']:.2f}, Volatility: {data['Volatility']:.4f}, MACD: {data['MACD']:.4f}" 
+                                for stock, data in stock_data.iterrows()])
+
         prompt = f"""Explain why these stocks might have been selected for an investment portfolio, 
-        given the following feature importances: 
+        given the following feature importances and stock data:
+
+        Feature Importances:
         {feature_importance_str}
         
-        Stocks: {', '.join(stocks[:5])} (showing top 5 out of {len(stocks)}).
+        Stock Data:
+        {stock_info}
         
         Please provide insights on:
         1. Which features seem to be the most important in the stock selection process?
         2. How might these features contribute to the potential performance of the selected stocks?
-        3. Are there any notable patterns or characteristics among the top selected stocks?
+        3. Are there any notable patterns or characteristics among the top selected stocks based on the provided data?
         4. What potential risks or considerations should investors be aware of when using this selection method?
         """
         
@@ -181,7 +212,7 @@ class LLMExplainer:
                 model="gpt-4",
                 temperature=0,
                 messages=[
-                    {"role": "system", "content": "You are a financial analyst explaining stock selections based on machine learning model outputs."},
+                    {"role": "system", "content": "You are a financial analyst explaining stock selections based on machine learning model outputs and stock data."},
                     {"role": "user", "content": prompt}
                 ]
             )
@@ -189,17 +220,13 @@ class LLMExplainer:
         except Exception as e:
             return f"Error in LLM explanation: {str(e)}"
 
-import time
-
-def main():
-    st.title('Advanced ML-Enhanced Algorithmic Trading Strategy')
-
-    # Sidebar
+def initialize_sidebar():
     st.sidebar.header('Strategy Parameters')
     num_stocks = st.sidebar.slider('Number of stocks for index', 10, 50, 10)
     investment_period = st.sidebar.slider('Investment period (days)', 30, 365, 90)
+    return num_stocks, investment_period
 
-    # Add explanation in sidebar
+def display_sidebar_explanation():
     st.sidebar.header('How it works')
     st.sidebar.write("""
     THIS IS AN EXPERIMENTAL TRADING STRATEGY. USE AT YOUR OWN RISK.
@@ -218,10 +245,7 @@ def main():
     This enhanced model considers both technical and fundamental factors, providing a more comprehensive analysis for stock selection.
     """)
 
-    # Initialize strategy
-    strategy = TradingStrategy(num_stocks)
-
-    # Select top stocks
+def select_top_stocks(strategy, num_stocks):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -237,10 +261,8 @@ def main():
     total_tickers = len(tickers)
     for i, ticker in enumerate(tickers):
         try:
-            # This part would be inside your TradingStrategy.select_top_stocks method
-            # We're simulating it here for the purpose of logging
             status_text.text(f'Processing {ticker} ({i+1}/{total_tickers})')
-            time.sleep(0.1)  # Simulate processing time
+            time.sleep(0.1)
             progress_bar.progress(10 + int(40 * (i+1) / total_tickers))
         except Exception as e:
             status_text.text(f'Error processing {ticker}: {str(e)}')
@@ -254,7 +276,7 @@ def main():
     progress_bar.progress(80)
     time.sleep(1)
 
-    top_stocks, feature_importances, stock_table = strategy.select_top_stocks()
+    top_stocks, feature_importances, stock_table, model_metrics = strategy.select_top_stocks()
     progress_bar.progress(100)
     status_text.text('Stock selection complete!')
     time.sleep(1)
@@ -262,56 +284,41 @@ def main():
     status_text.empty()
     progress_bar.empty()
 
+    return top_stocks, feature_importances, stock_table, model_metrics
+
+def display_stock_table(stock_table, num_stocks):
     st.write(f'Top {num_stocks} stocks selected for index composition:')
     st.dataframe(stock_table)
 
-    # LLM Explanation
+def get_llm_explanation(top_stocks, feature_importances, stock_table):
     api_key = os.environ.get("OPENAI_API_KEY") or st.text_input("Enter your OpenAI API key:", type="password")
     llm_explainer = LLMExplainer(api_key)
     
     explanation_status = st.empty()
     explanation_status.text('Generating explanation...')
-    explanation = llm_explainer.get_explanation(top_stocks, feature_importances)
+    explanation = llm_explainer.get_explanation(top_stocks, feature_importances, stock_table)
     explanation_status.empty()
     
     st.write("Explanation of stock selection:")
     st.write(explanation)
 
-    # Calculate dates and create custom index
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=investment_period)
-    two_year_start = end_date - timedelta(days=365*2)
-
+def create_custom_index(strategy, top_stocks, num_stocks, start_date, end_date):
     index_status = st.empty()
     index_status.text('Creating custom index and fetching historical data...')
     
-    sp500 = yf.Ticker('^GSPC')
-    sp500_data = sp500.history(start=start_date, end=end_date)['Close']
     custom_index = strategy.create_custom_index(top_stocks, [1/num_stocks]*num_stocks, start_date, end_date)
 
-    # Fetch 2 years of historical data for each stock
-    historical_data = {}
-    for i, stock in enumerate(top_stocks):
-        index_status.text(f'Fetching historical data for {stock} ({i+1}/{len(top_stocks)})')
-        data, _ = StockData.get_stock_data(stock, two_year_start, end_date)
-        historical_data[stock] = data['Close']
-
     index_status.empty()
+    return custom_index
 
-    # Create a plot for 2-year trading history
+def plot_trading_history(top_stocks, historical_data):
     st.write('Generating 2-year trading history plot...')
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = go.Figure()
 
     for stock in top_stocks:
         fig.add_trace(
-            go.Scatter(x=historical_data[stock].index, y=historical_data[stock], name=stock),
-            secondary_y=False,
+            go.Scatter(x=historical_data[stock].index, y=historical_data[stock], name=stock)
         )
-
-    fig.add_trace(
-        go.Scatter(x=sp500_data.index, y=sp500_data, name='S&P 500', line=dict(color='black', width=3)),
-        secondary_y=True,
-    )
 
     fig.update_layout(
         title_text="2-Year Trading History of Selected Stocks",
@@ -321,11 +328,9 @@ def main():
         height=600,
     )
 
-    fig.update_yaxes(title_text="S&P 500 Index", secondary_y=True)
-
     st.plotly_chart(fig, use_container_width=True)
 
-    # Combine strategies and plot results
+def plot_strategy_comparison(custom_index, sp500_data):
     st.write('Generating strategy comparison plot...')
     combined_strategy = pd.DataFrame({
         'Custom Index': custom_index * 0.5,
@@ -334,16 +339,53 @@ def main():
     combined_strategy['Total'] = combined_strategy.sum(axis=1)
     st.line_chart(combined_strategy)
 
-    # Display performance metrics
+def display_performance_metrics(combined_strategy):
     st.write('Performance Metrics:')
-    total_return = (combined_strategy['Total'].iloc[-1] / combined_strategy['Total'].iloc[0] - 1) * 100
-    st.write(f'Total Return: {total_return:.2f}%')
+    
     custom_index_return = (combined_strategy['Custom Index'].iloc[-1] / combined_strategy['Custom Index'].iloc[0] - 1) * 100
-    st.write(f'Custom Index Return: {custom_index_return:.2f}%')
     sp500_return = (combined_strategy['S&P 500'].iloc[-1] / combined_strategy['S&P 500'].iloc[0] - 1) * 100
+    
+    total_return = (custom_index_return + sp500_return) / 2
+    
+    st.write(f'Total Return: {total_return:.2f}%')
+    st.write(f'Custom Index Return: {custom_index_return:.2f}%')
     st.write(f'S&P 500 Return: {sp500_return:.2f}%')
 
-    # Rebalancing suggestion
+def main():
+    st.title('Cherry Picker: Advanced ML-Enhanced Algorithmic Trading Strategy')
+
+    num_stocks, investment_period = initialize_sidebar()
+    display_sidebar_explanation()
+
+    strategy = TradingStrategy(num_stocks)
+    top_stocks, feature_importances, stock_table, model_metrics = select_top_stocks(strategy, num_stocks)
+    display_stock_table(stock_table, num_stocks)
+    
+    st.write("Model Performance Metrics:")
+    st.write(f"MSE: {model_metrics[0]:.6f}")
+    st.write(f"RMSE: {model_metrics[1]:.6f}")
+    st.write(f"R²: {model_metrics[2]:.6f}")
+    st.write(f"Cross-validation RMSE: {model_metrics[3]:.6f}")
+
+    get_llm_explanation(top_stocks, feature_importances, stock_table)
+
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=investment_period)
+    two_year_start = end_date - timedelta(days=365*2)
+
+    sp500 = yf.Ticker('^GSPC')
+    sp500_data = sp500.history(start=start_date, end=end_date)['Close']
+    custom_index = create_custom_index(strategy, top_stocks, num_stocks, start_date, end_date)
+
+    historical_data = {stock: StockData.get_stock_data(stock, two_year_start, end_date)[0]['Close'] for stock in top_stocks}
+
+    plot_trading_history(top_stocks, historical_data)
+    plot_strategy_comparison(custom_index, sp500_data)
+    display_performance_metrics(pd.DataFrame({
+        'Custom Index': custom_index,
+        'S&P 500': sp500_data / sp500_data.iloc[0]
+    }))
+
     st.write('Rebalancing Suggestion:')
     st.write('Consider rebalancing your portfolio every 30-90 days to maintain the 50/50 split between the custom index and S&P 500.')
 
